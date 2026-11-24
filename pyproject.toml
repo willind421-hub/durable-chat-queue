@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "durable-chat-queue"
+version = "0.1.0"
+description = "Durable, idempotent SQLite operation inbox for chat and agent turns: per-conversation FIFO, bounded parallel lanes, and crash-safe UNKNOWN fencing."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "willind" }]
+keywords = ["sqlite", "queue", "inbox", "idempotency", "chat", "agent", "durable"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/durable_chat_queue"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
