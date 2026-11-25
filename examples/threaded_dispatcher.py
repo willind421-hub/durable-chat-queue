@@ -29,6 +29,24 @@ import time
 from durable_chat_queue import ChatOperationStore
 
 
+def reserve_new_database(path: Path) -> None:
+    """Reserve a fresh demo file; never open an existing DB or its sidecars.
+
+    Use a trusted directory with no other process writing this demo path.
+    Exclusive creation also rejects a competing creator and existing symlinks.
+    """
+    path = Path(path)
+    for candidate in [path, *(Path(str(path) + suffix) for suffix in ("-wal", "-shm", "-journal"))]:
+        if candidate.exists() or candidate.is_symlink():
+            raise FileExistsError(f"Refusing existing demo database or sidecar: {candidate}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("xb"):
+            pass
+    except FileExistsError:
+        raise FileExistsError(f"Refusing existing demo database: {path}") from None
+
+
 class ProvenPreSideEffectError(Exception):
     """The turn was rejected before anything observable happened."""
 
@@ -57,8 +75,19 @@ def submit(store: ChatOperationStore, op: str, conversation: str, text: str) -> 
     return disposition
 
 
-def run_workers(store: ChatOperationStore, *, workers: int, lanes: int) -> list[tuple]:
-    """Drain the queue with ``workers`` threads; return (op, conv, start, end) spans."""
+def run_workers(
+    store: ChatOperationStore, *, workers: int, lanes: int,
+    stop: threading.Event | None = None,
+) -> list[tuple]:
+    """Return (op, conv, start, end) spans from synthetic worker threads.
+
+    Without ``stop``, drain a finite preloaded batch (30-second safety bound).
+    With ``stop``, stay resident even when idle; poll until it is set. This
+    also picks up queued tails after an inline executor releases its lane,
+    without relying on a notification that could race with an empty scan.
+    Stop admission before setting the event; current executions finish, but
+    remaining QUEUED work is left durable for the next startup.
+    """
 
     spans: list[tuple] = []
     lock = threading.Lock()
@@ -84,12 +113,17 @@ def run_workers(store: ChatOperationStore, *, workers: int, lanes: int) -> list[
 
     def worker() -> None:
         deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
+        while stop is None or not stop.is_set():
+            if stop is None and time.monotonic() >= deadline:
+                return
             row = store.claim_next(lanes=lanes)
             if row is None:
-                if store.counts().get("QUEUED", 0) == 0:
+                if stop is None and store.counts().get("QUEUED", 0) == 0:
                     return
-                time.sleep(0.005)  # lanes full, or only busy conversations are queued
+                if stop is None:
+                    time.sleep(0.005)  # finite batch: wait for a busy lane
+                else:
+                    stop.wait(0.005)  # resident: also wait when the queue is empty
                 continue
             execute(row)
 
@@ -121,6 +155,9 @@ def check_spans(spans: list[tuple], submitted: dict[str, list[str]], lanes: int)
 
 
 def main(db_path: Path, *, workers: int, lanes: int) -> None:
+    if workers < 1 or lanes < 1:
+        raise ValueError("workers and lanes must be positive")
+    reserve_new_database(db_path)
     print(f"database: {db_path}")
 
     print("\n[1] previous process: one turn RUNNING, one still QUEUED, then a crash")
@@ -173,12 +210,15 @@ def main(db_path: Path, *, workers: int, lanes: int) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--db", type=Path, help="SQLite file to use (default: a temporary file)")
+    parser.add_argument("--db", type=Path, help="NEW SQLite file only; existing DBs/sidecars are refused (default: temporary)")
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--lanes", type=int, default=2)
     args = parser.parse_args()
-    if args.db:
-        main(args.db, workers=args.workers, lanes=args.lanes)
-    else:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            main(Path(tmp) / "operations.db", workers=args.workers, lanes=args.lanes)
+    try:
+        if args.db:
+            main(args.db, workers=args.workers, lanes=args.lanes)
+        else:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                main(Path(tmp) / "operations.db", workers=args.workers, lanes=args.lanes)
+    except (FileExistsError, ValueError) as exc:
+        parser.error(str(exc))

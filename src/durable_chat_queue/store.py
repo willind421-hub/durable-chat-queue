@@ -17,6 +17,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import time
 from typing import Any
 
 
@@ -30,8 +31,10 @@ def _now() -> str:
 def canonical_payload(payload: dict[str, Any]) -> tuple[str, str]:
     """Return ``(canonical_json, sha256_hex)`` for a payload.
 
-    Keys are sorted and separators are compact, so payloads with the same
-    content always produce the same bytes and digest regardless of key order.
+    Uses Python JSON encoding (not RFC 8785/JCS): sorted keys, compact
+    separators, UTF-8, no Unicode normalization, and no non-finite numbers.
+    In particular, integers and floats such as 1 and 1.0 have different digests.
+    Compute digests on the server or use this same encoder on Python clients.
     """
 
     encoded = json.dumps(
@@ -39,6 +42,7 @@ def canonical_payload(payload: dict[str, Any]) -> tuple[str, str]:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
     return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -53,66 +57,78 @@ class ChatOperationStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=5.0)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS chat_operations (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                client_operation_id TEXT NOT NULL UNIQUE,
-                request_id TEXT NOT NULL UNIQUE,
-                conversation_id TEXT NOT NULL,
-                device_id TEXT,
-                workspace_id TEXT,
-                payload_sha256 TEXT NOT NULL,
-                payload_json TEXT,
-                state TEXT NOT NULL,
-                message_id TEXT,
-                error_code TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_chat_operations_queue
-                ON chat_operations(state, sequence);
-            CREATE INDEX IF NOT EXISTS idx_chat_operations_conversation
-                ON chat_operations(conversation_id, sequence);
-            """
-        )
-        columns = {
-            str(row["name"])
-            for row in connection.execute("PRAGMA table_info(chat_operations)").fetchall()
-        }
-        if "workspace_id" not in columns:
-            connection.execute("ALTER TABLE chat_operations ADD COLUMN workspace_id TEXT")
-        # Older rows carried their workspace scope only inside the transient
-        # payload. Recover that scope while the payload still exists; terminal
-        # rows whose payload was already compacted remain explicitly unbound
-        # and must never be guessed or rebound to another device.
-        legacy_rows = connection.execute(
-            "SELECT sequence, payload_json FROM chat_operations "
-            "WHERE workspace_id IS NULL AND payload_json IS NOT NULL"
-        ).fetchall()
-        for legacy_row in legacy_rows:
-            try:
-                payload = json.loads(str(legacy_row["payload_json"]))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            workspace_id = (
-                str(payload.get("workspace_id") or "").strip()
-                if isinstance(payload, dict)
-                else ""
-            )
-            if not workspace_id or len(workspace_id) > 80:
-                continue
-            connection.execute(
-                "UPDATE chat_operations SET workspace_id=? "
-                "WHERE sequence=? AND workspace_id IS NULL",
-                (workspace_id, int(legacy_row["sequence"])),
-            )
-        connection.commit()
-        return connection
+        try:
+            connection.execute("PRAGMA busy_timeout=5000")
+            # Ask SQLite to overwrite deleted content as pages are rewritten.
+            # This cannot erase earlier WAL frames, backups or filesystem copies.
+            connection.execute("PRAGMA secure_delete=ON")
+            # Concurrent first open can make the journal-mode transition report
+            # SQLITE_BUSY immediately rather than honoring busy_timeout.
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    connection.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+                connection.execute("BEGIN IMMEDIATE")
+                # Recheck after acquiring the writer lock: another connection
+                # may have completed migration while this one was waiting.
+                if connection.execute("PRAGMA user_version").fetchone()[0] < 1:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS chat_operations (
+                            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                            client_operation_id TEXT NOT NULL UNIQUE,
+                            request_id TEXT NOT NULL UNIQUE,
+                            conversation_id TEXT NOT NULL,
+                            device_id TEXT,
+                            workspace_id TEXT,
+                            payload_sha256 TEXT NOT NULL,
+                            payload_json TEXT,
+                            state TEXT NOT NULL,
+                            message_id TEXT,
+                            error_code TEXT,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            started_at TEXT,
+                            completed_at TEXT
+                        )
+                        """
+                    )
+                    connection.execute("CREATE INDEX IF NOT EXISTS idx_chat_operations_queue ON chat_operations(state, sequence)")
+                    connection.execute("CREATE INDEX IF NOT EXISTS idx_chat_operations_conversation ON chat_operations(conversation_id, sequence)")
+                    columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(chat_operations)")}
+                    if "workspace_id" not in columns:
+                        connection.execute("ALTER TABLE chat_operations ADD COLUMN workspace_id TEXT")
+                    # Version-zero DBs may already have the column. Backfill
+                    # once only; compacted terminal rows stay explicitly unbound.
+                    legacy_rows = connection.execute(
+                        "SELECT sequence, payload_json FROM chat_operations "
+                        "WHERE workspace_id IS NULL AND payload_json IS NOT NULL"
+                    ).fetchall()
+                    for legacy_row in legacy_rows:
+                        try:
+                            payload = json.loads(str(legacy_row["payload_json"]))
+                        except (TypeError, ValueError):
+                            continue
+                        workspace_id = str(payload.get("workspace_id") or "").strip() if isinstance(payload, dict) else ""
+                        if not workspace_id or len(workspace_id) > 80:
+                            continue
+                        connection.execute(
+                            "UPDATE chat_operations SET workspace_id=? WHERE sequence=? AND workspace_id IS NULL",
+                            (workspace_id, int(legacy_row["sequence"])),
+                        )
+                    connection.execute("PRAGMA user_version=1")
+                connection.commit()
+            return connection
+        except BaseException:
+            connection.rollback()
+            connection.close()
+            raise
 
     @contextmanager
     def _session(self) -> Iterator[sqlite3.Connection]:
@@ -156,22 +172,36 @@ class ChatOperationStore:
         device_id: str | None,
         payload: dict[str, Any],
     ) -> tuple[str, dict]:
-        """Insert once; replay same bytes and reject identity reuse with new bytes."""
+        """Insert once; replay only matching payload and conversation/device/workspace.
+
+        Identities remain globally unique. Every conflict returns an empty dict,
+        never a row belonging to the existing operation.
+        """
 
         payload_json, payload_sha256 = canonical_payload(payload)
         workspace_id = str(payload.get("workspace_id") or "") or None
         now = _now()
         with self._session() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            request_owner = connection.execute(
+                "SELECT client_operation_id FROM chat_operations WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if request_owner is not None and request_owner["client_operation_id"] != client_operation_id:
+                return "CONFLICT", {}
             row = connection.execute(
                 "SELECT * FROM chat_operations WHERE client_operation_id=?",
                 (client_operation_id,),
             ).fetchone()
             if row is not None:
-                decoded = self._decode(row)
-                if str(row["payload_sha256"]) != payload_sha256:
-                    return "CONFLICT", decoded
-                return "REPLAY", decoded
+                if (
+                    row["conversation_id"] != conversation_id
+                    or row["device_id"] != device_id
+                    or row["workspace_id"] != workspace_id
+                    or str(row["payload_sha256"]) != payload_sha256
+                ):
+                    return "CONFLICT", {}
+                return "REPLAY", self._decode(row)
             try:
                 connection.execute(
                     """
@@ -195,14 +225,7 @@ class ChatOperationStore:
                 )
             except sqlite3.IntegrityError:
                 # A request_id may not be rebound to a second operation either.
-                row = connection.execute(
-                    "SELECT * FROM chat_operations WHERE request_id=?",
-                    (request_id,),
-                ).fetchone()
-                return "CONFLICT", self._decode(row) or {
-                    "client_operation_id": client_operation_id,
-                    "request_id": request_id,
-                }
+                return "CONFLICT", {}
             row = connection.execute(
                 "SELECT * FROM chat_operations WHERE client_operation_id=?",
                 (client_operation_id,),
@@ -219,7 +242,12 @@ class ChatOperationStore:
         workspace_id: str,
         payload_sha256: str,
     ) -> tuple[str, dict]:
-        """Atomically tombstone an absent identity so a late POST cannot run."""
+        """Tombstone an absent identity; return EXISTING only within its scope.
+
+        Foreign scope or request identity collisions return ("CONFLICT", {}).
+        Within the same scope EXISTING reconciles the original receipt even if
+        the caller's digest differs; it never changes or requeues that row.
+        """
 
         now = _now()
         sealed_payload = json.dumps(
@@ -228,11 +256,23 @@ class ChatOperationStore:
         )
         with self._session() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            request_owner = connection.execute(
+                "SELECT client_operation_id FROM chat_operations WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if request_owner is not None and request_owner["client_operation_id"] != client_operation_id:
+                return "CONFLICT", {}
             row = connection.execute(
                 "SELECT * FROM chat_operations WHERE client_operation_id=?",
                 (client_operation_id,),
             ).fetchone()
             if row is not None:
+                if (
+                    row["conversation_id"] != conversation_id
+                    or row["device_id"] != device_id
+                    or row["workspace_id"] != workspace_id
+                ):
+                    return "CONFLICT", {}
                 return "EXISTING", self._decode(row)
             try:
                 connection.execute(
@@ -251,12 +291,7 @@ class ChatOperationStore:
                     ),
                 )
             except sqlite3.IntegrityError:
-                row = connection.execute(
-                    "SELECT * FROM chat_operations WHERE client_operation_id=? "
-                    "OR request_id=? LIMIT 1",
-                    (client_operation_id, request_id),
-                ).fetchone()
-                return "EXISTING", self._decode(row) or {}
+                return "CONFLICT", {}
             row = connection.execute(
                 "SELECT * FROM chat_operations WHERE client_operation_id=?",
                 (client_operation_id,),

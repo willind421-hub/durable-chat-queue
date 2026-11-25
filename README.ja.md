@@ -47,12 +47,12 @@ Durable Chat Queue の答えはこうです。実行中のターンはキャン�
 
 | 保証 | 仕組み |
 |---|---|
-| **冪等な投入。** `client_operation_id` は最大 1 回しか受け付けません。同じ id で正規化後のペイロードも同じなら `REPLAY`(状態にかかわらず既存の行)、同じ id でペイロードが違えば `CONFLICT` です。`request_id` を別のオペレーションに付け替えることもできません。 | `UNIQUE` 制約と正規化 JSON ペイロードの SHA-256 を、1 つの `BEGIN IMMEDIATE` トランザクション内で確認します。 |
+| **冪等な投入。** `client_operation_id` は最大1回のみ受け付けます。同じ id・正規ペイロード・会話/端末/ワークスペース範囲なら状態を問わず既存行と `REPLAY` を返します。ペイロードや範囲が異なれば既存フィールドなしの `("CONFLICT", {})` です。`request_id` も別操作へ付け替えられません。 | グローバルな `UNIQUE` 制約、範囲比較、SHA-256 を1つの `BEGIN IMMEDIATE` 内で確認します。 |
 | **サーバー受付順。** 受け付けた各オペレーションに増加する `sequence` が付きます。 | `INTEGER PRIMARY KEY AUTOINCREMENT` |
 | **会話ごとに RUNNING は最大 1 つ、FIFO 順。** | `claim()` と `claim_next()` が、`QUEUED → RUNNING` の更新と同じ書き込みトランザクション内で、実行中の会話と最古の待機番号を確認します。 |
 | **会話間の並列度の上限。** 同時に実行される会話は最大 `lanes` 個です。 | 同じトランザクション内で RUNNING の会話数を数えます。 |
 | **再起動後の暗黙の再実行なし。** `recover_inflight()` は RUNNING の行をすべて `UNKNOWN` にします。まだ始まっていない `QUEUED` の行は残り、そのまま処理されます。 | `claim*()` は `QUEUED` の行しか選びません。 |
-| **復旧用の受信箱。** `FAILED` と `UNKNOWN` の行は投入されたペイロードをそのまま保持します。`COMPLETED` と `CANCELLED` の行はペイロードを消し、受領記録(`payload_sha256`、`message_id`、`error_code`、時刻)だけを残します。 | `finish()` は `COMPLETED` と `CANCELLED` のときだけペイロードを消します。 |
+| **復旧用の受信箱。** `FAILED` と `UNKNOWN` はペイロードを保持します。`COMPLETED` と `CANCELLED` は本文を論理的に消し、ID・範囲・受領記録(`payload_sha256`、`message_id`、`error_code`、時刻)を残します。フォレンジック消去ではありません。 | `finish()` は両状態でのみ `payload_json=NULL` にし、接続ごとに `secure_delete=ON` を設定します(制約参照)。 |
 | **不在の受領記録。** サーバーに届かなかったと判断して諦めたオペレーション id を、クライアントは `confirm_missing()` で封印できます。同じリクエストが遅れて届いても、識別されるだけでキューには入りません。 | 1 つのトランザクションで `CONFIRMED_MISSING` の墓標行を挿入します。 |
 
 意図的に**しない**こともあります。実行中のターンはキャンセルしません(それは実行側の
@@ -88,43 +88,47 @@ stateDiagram-v2
 - 公開メソッドは呼び出しごとに短命な接続を開きます(`busy_timeout=5000`、WAL ジャーナル)。
   確認してから書き込むメソッドは `BEGIN IMMEDIATE` で始まるため、確認と更新は同じファイルへの
   他のすべての書き込みと直列化されます。
-- ペイロードは `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)` で
-  正規化し、SHA-256 でハッシュします。キーの順序や空白は影響せず、値が 1 つでも変われば
-  別のペイロードになります。
-- ペイロードに `workspace_id` キーがあれば、その値を専用の列にも保存し、ペイロード削除後も
-  スコープ情報が残るようにします。この列がない古いデータベースを開くと列を追加し、まだ
-  ペイロードが残っている行は値を埋めます。すでにペイロードが消えた行は推測せず `NULL` の
-  ままにします。
+- ペイロードは Python の `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)` を UTF-8 にし、SHA-256 でハッシュします。キー順序と JSON 書式の空白は無関係ですが、文字列内の空白は値の一部です。`NaN`、`Infinity`、`-Infinity` は DB を開く前に `ValueError` になります。**RFC 8785/JCS ではありません。** `1` と `1.0` は異なり、Unicode 正規化も行いません。信頼するサーバーで digest を計算するか Python クライアントも同じエンコーダーを使ってください。JavaScript 等のバイト列が一致するとは限りません。
+- ペイロードの `workspace_id` は本文を消した後も範囲を保持する別カラムに保存します。バージョン0 DB は `BEGIN IMMEDIATE` で書き込みロックを取得し、バージョンを再確認して **一度だけ** `PRAGMA user_version=1` に移行します。なければカラムを追加し、すでにあっても保持された本文から一度だけ補完します。本文なし・不正・ワークスペースなしは `NULL` のままで次の呼び出しでは再走査しません。旧値は前後空白を除去し80文字超は無視します。専用キュー DB を使いスキーマ/バージョン欄を他アプリと共有しないでください。このロックは複数プロセスの実行/復旧対応を意味しません。
 - このストアは受信箱であって、会話ログではありません。メッセージと返答は別の会話履歴に置き、
   ストアは識別子、順序、一時的なペイロード、受領記録だけを覚えます。
 
 ### ディスパッチャーのパターン
 
-元のサービスでは、asyncio ベースの HTTP バックエンドがストアを次のように使っていました。
+ライブサービスでは一度だけ drain するタスクではなく常駐ワーカーを使います。
 
-1. **起動時:** `recover_inflight()` を 1 回呼び、最大 `lanes` 個のドレインタスクを起動します。
+1. **起動時:** リクエスト受付前に `recover_inflight()` を一度呼び、キューが空でも最大 `lanes` 個のドレインタスクを維持します。
 2. **新しいリクエスト:** `submit()` を呼びます。
    - `CONFLICT` → 拒否(HTTP 409)。
-   - `REPLAY` → 既存の受領記録を返します。行がまだ `QUEUED` ならドレインタスクが動いているか
-     確認します。`CONFIRMED_MISSING` なら拒否します。
+   - `REPLAY` → 認可後に許可した受領フィールドのみ返し、行全体は公開しません。`CONFIRMED_MISSING` は拒否し、replay をインライン再実行しません。
    - `ACCEPTED` → `claim(op_id, lanes=lanes)` でその場での実行を試みます。`None` なら
      (会話が実行中、レーンが満杯、または同じ会話のより古いメッセージが待っている)、すぐに
      「待機中」と応答し、ドレインタスクに任せます。
-3. **ドレインループ:** `claim_next(lanes=lanes)` → 実行 → `finish()` を、`None` が返るまで
-   繰り返します。
+3. **常駐ループ:** `claim_next(lanes=lanes)` → 実行 → `finish()`。`None` なら少し待って再試行し、**終了しません**。空キュー走査と送信が競合しても、インライン実行後に次のリクエストがなくても polling で後続を処理し、通知取りこぼしを避けます。
 4. **結果の対応付け:** 成功 → `COMPLETED`、ユーザーによるキャンセル → `CANCELLED`、
    副作用の前に失敗したことが証明できる場合 → `FAILED`、それ以外の例外・応答の消失・ターン
    途中でのタスクキャンセル → `UNKNOWN`。実行側がターンをまったく開始せずに断った場合
    (例: メモリ上のレーンゲートと判断が食い違った)は `requeue()` を呼びます。
+5. **終了:** 新規受付を止め、インライン処理を待ち、stop イベントを設定してドレインタスクを待ちます。進行中のターンは完了させ、残る QUEUED は次回起動まで保持します。DB/受領保存エラーでワーカーが黙って停止しないよう監視してください。この骨組みはサーバー実装ではありません。
 
 最小限の asyncio の骨組みです(`run_turn` とエラー型は各自で実装)。
 
 ```python
 import asyncio
 
-async def drain(store, lanes):
-    while (row := store.claim_next(lanes=lanes)) is not None:
-        await execute(store, row)
+async def drain(store, lanes, stop):
+    while not stop.is_set():
+        row = store.claim_next(lanes=lanes)
+        if row is None:
+            await asyncio.sleep(0.05)
+        else:
+            await execute(store, row)
+
+async def start_drainers(store, lanes):
+    store.recover_inflight()  # before requests or workers, once per owning process
+    stop = asyncio.Event()
+    tasks = [asyncio.create_task(drain(store, lanes, stop)) for _ in range(lanes)]
+    return stop, tasks  # shutdown: stop.set(); await asyncio.gather(*tasks)
 
 async def execute(store, row):
     op = row["client_operation_id"]
@@ -141,16 +145,23 @@ async def execute(store, row):
         store.finish(op, state="COMPLETED", message_id=reply.message_id)
 ```
 
-[`examples/threaded_dispatcher.py`](examples/threaded_dispatcher.py) は、同じパターンを
-スレッドで実装し、合成データで実行できるサンプルです。
+[`examples/threaded_dispatcher.py`](examples/threaded_dispatcher.py) は合成データとワーカースレッドを使う実行例です。標準の `run_workers()` は事前投入した有限バッチを30秒の安全上限内で drain します。ライブサービスでは `stop` に `threading.Event` を渡し、設定されるまで常駐させます。テストは空キューからのインライン実行後の後続処理と、空走査の境界での送信を検証します。
+
+### 範囲と外部への受領記録
+
+信頼するサーバー内部のストアであり、**認証層ではありません**。両 ID は会話ごとでなくグローバルに一意です。`submit()` は replay 前に会話・端末(`None` 含む)・保存済みワークスペース(`NULL` 含む)を比較し、全 conflict は `{}` を返します。未使用の新しい `request_id` で既存操作を照会できますが、別操作が所有する ID は奪えません。`confirm_missing()` は digest が異なっても同範囲のみ `EXISTING`、異なる範囲やリクエスト ID 衝突は `("CONFLICT", {})` です。ワークスペース不明の旧圧縮行は未指定のまま再結合しません。
+
+認証済み呼び出し元から会話・端末・ワークスペースを導出して認可し、推測しにくいグローバル ID を使ってください。一般的な conflict でも ID の使用有無は分かり得ます。同範囲の replay/EXISTING 行には保持本文があり得るため、認可後に `client_operation_id`、`sequence`、`state`、`message_id` など許可フィールドだけ返してください。`get()`、`list()`、claim、`finish()`、`requeue()`、復旧は呼び出し元/所有トークンを検証しない信頼された管理操作です。未認証エンドポイントとして直接公開しないでください。
 
 ## クイックスタート
 
 ```bash
-git clone <this repository> && cd durable-chat-queue
+git clone https://github.com/willind421-hub/durable-chat-queue.git && cd durable-chat-queue
 python -m pip install -e .
 python examples/threaded_dispatcher.py
 ```
+
+デモは標準で一時 DB を使います。`--db` は **新しいパスのみ** 受け付けます。既存ファイル(空ファイル含む)・ディレクトリ・シンボリックリンクと `-wal`、`-shm`、`-journal` 補助ファイルがあればストア生成前に拒否し、ファイルは排他的に作成します。同じパスへの競合 writer がいない信頼できるディレクトリを使ってください。補助ファイル検査はディレクトリ全体の原子的予約ではありません。運用 DB を指定しないでください。同じ `--db` での再実行は安全に失敗します。
 
 ```python
 from pathlib import Path
@@ -207,14 +218,15 @@ if row is not None:
 | `finish(client_operation_id, *, state, message_id=None, error_code=None)` | RUNNING のオペレーションの受領記録を書く。`state` は `COMPLETED`、`FAILED`、`CANCELLED`、`UNKNOWN` のいずれか。 | row。それ以外の状態なら `ValueError`、RUNNING でなければ `KeyError` |
 | `requeue(client_operation_id, *, error_code=None)` | 開始していない RUNNING のオペレーションを、同じ番号のまま `QUEUED` に戻す。 | `None` |
 | `recover_inflight()` | RUNNING のオペレーションをすべて `UNKNOWN` にする。起動時のみ呼ぶ。 | 対象になった行数 |
-| `confirm_missing(*, client_operation_id, request_id, conversation_id, device_id, workspace_id, payload_sha256)` | サーバーに届かなかったとクライアントが判断した id を封印。 | `("CONFIRMED_MISSING" \| "EXISTING", row)` |
+| `confirm_missing(*, client_operation_id, request_id, conversation_id, device_id, workspace_id, payload_sha256)` | 未受信と判断した id を封印し、同範囲の既存行を照会。 | `("CONFIRMED_MISSING" \| "EXISTING", row)` または `("CONFLICT", {})` |
 | `get(client_operation_id)` | オペレーションを 1 件取得。 | row または `None` |
 | `list(*, conversation_id, after_sequence=0, limit=50)` | 会話のオペレーションをページ単位で取得(1〜100 行)。 | row のリスト |
 | `counts()` | 状態ごとのオペレーション数。 | `dict[str, int]` |
-| `canonical_payload(payload)` | 正規化 JSON とその SHA-256(`confirm_missing` 用にクライアント側でも使う)。 | `(json_text, sha256_hex)` |
+| `canonical_payload(payload)` | Python エンコード JSON と SHA-256。`confirm_missing` 用 digest は信頼するサーバーでの計算を推奨。 | `(json_text, sha256_hex)`; 非有限数は `ValueError` |
 
 row はテーブルの列を持つ `dict` で、`payload_json` の代わりに `payload`(デコードした dict、
 削除済みなら `None`)が入ります。
+`submit()` の全 `CONFLICT` は既存行ではなく空 dict を返します。
 
 ## テストの実行
 
@@ -235,6 +247,7 @@ CI は Ubuntu と Windows 上の Python 3.10 と 3.13 で、テストとサン�
   呼んでください。また、それぞれがこのメソッドを呼ぶ複数のサービスプロセスで 1 つのファイルを
   共有しないでください。分散キューではなく、ファイルをネットワークファイルシステムに置くことも
   できません(SQLite の WAL は 1 台のホスト上の共有メモリを必要とします)。
+- **信頼するサービス向け API であり認証・認可ではありません。** `submit()` と `confirm_missing()` の範囲確認は呼び出し元を認証しません。読み取り・状態変更メソッドに呼び出し元別の権限やワーカー fencing token はないため、信頼するサービスの背後でのみ使ってください。`requeue()` は不在または RUNNING 以外の作業には何もせず `None` を返すので、再投入成功の確認には使えません。
 - **止まったワーカーはその会話を塞ぎます。** プロセスが生きたままワーカーが `finish()` を
   呼ばずに止まると、次の `recover_inflight()` まで、その会話は RUNNING のまま塞がります。
   すべての終了経路で受領記録を書いてください。
@@ -246,22 +259,18 @@ CI は Ubuntu と Windows 上の Python 3.10 と 3.13 で、テストとサン�
   `client_operation_id` を使います。
 - **保持ポリシーはありません。** 受領記録を含む行は削除されません。アーカイブや整理は各自で
   行ってください。
-- **人間のペースのトラフィック向けです。** 呼び出しごとに新しい接続を開き、冪等なスキーマ
-  確認をやり直します。コードは単純で堅牢ですが、大量のジョブ処理向けの性能測定はしていません。
+- **人間のペースのトラフィック向けです。** 呼び出しごとに接続とバージョン確認を行い、移行/本文 backfill は一度だけです。SQLite 呼び出しは asyncio 骨組みでも同期式で、ロックで約5秒待つことがあります。高スループットのベンチマークはありません。
+- **論理消去であり物理消去の保証ではありません。** `secure_delete=ON` はページ書き換え時の削除内容上書きを要求します。テストは checkpoint 後の主 DB にマーカーがないことを確認しますが、旧 WAL フレームや reader snapshot には本文が残り得ます。旧版で既に解放されたページ、バックアップ、ファイルシステム snapshot、SSD コピー、メモリ、アプリログは消去しません。暗号化や自動 checkpoint/安全消去ポリシーもありません。DB/補助ファイルのディレクトリ権限とバックアップを管理してください。ID・ワークスペース・ハッシュ・受領メタデータは残り、FAILED/UNKNOWN は本文を無期限に保持します。受領フィールドに秘密を入れないでください。
+- ファイル権限は OS の既定値を継承し、ライブラリは強化しません。DB と補助ファイルのディレクトリ権限を制限してください。
 - ペイロードは JSON にシリアライズできる dict である必要があり、サイズの制限はありません。
   古いデータの補完時、80 文字を超える `workspace_id` は無視されます。
-- `confirm_missing()` は、呼び出し側が `canonical_payload()` と同じ方法で `payload_sha256` を
-  計算していることを前提とします。
+- `confirm_missing()` は呼び出し元の digest を信頼し、不在の本文を検証できません。信頼するサーバーで `canonical_payload()` を使ってください。言語間の正規 JSON プロトコルではありません。
 - 時刻はローカル時計による UTC の ISO-8601 文字列です。順序の判断には時刻ではなく、常に
   `sequence` を使います。
 
 ## 由来
 
-このコードは、開発を終了した個人向け AI アシスタントプロジェクト willind から切り出したもの
-です。元はデスクトップ/モバイルのチャットクライアントとローカルのアシスタントサービスの間の
-コマンド受信箱として使われていました。ストアのロジックは変えていません。公開にあたり、コメントを
-英語に翻訳し、公開メソッドに docstring を追加し、接続を明示的に閉じるようにし、周辺の HTTP
-サービスは合成データのサンプルに置き換えました。
+このコードは終了した個人 AI アシスタント willind のデスクトップ/モバイルクライアントとローカルサービス間のコマンド受信箱から抽出しました。独立版は範囲付き照合、一度だけのロック付き移行、SQLite secure-delete 強化、非有限 JSON 拒否、回帰テストと合成ディスパッチャー例を追加しました。コメント/docstring は英語で、接続を明示的に閉じます。周囲の HTTP サービスは含みません。
 
 ## ライセンス
 

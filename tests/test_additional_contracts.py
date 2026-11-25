@@ -36,7 +36,7 @@ def test_request_id_cannot_be_rebound_to_another_operation(tmp_path):
     assert _submit(store, "op_first", request_id="rq_shared")[0] == "ACCEPTED"
     state, row = _submit(store, "op_second", request_id="rq_shared")
     assert state == "CONFLICT"
-    assert row["client_operation_id"] == "op_first"
+    assert row == {}  # conflicting callers must not receive the existing row
     assert store.get("op_second") is None
     assert store.counts() == {"QUEUED": 1}
 
@@ -92,7 +92,7 @@ def test_confirm_missing_seals_identity_so_late_submit_never_runs(tmp_path):
 
 def test_confirm_missing_reports_existing_operation(tmp_path):
     store = ChatOperationStore(tmp_path / "ops.db")
-    _submit(store, "op_present_001")
+    _submit(store, "op_present_001", workspace_id="ws:1")
     state, row = store.confirm_missing(
         client_operation_id="op_present_001",
         request_id="op_present_001",

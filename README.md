@@ -49,12 +49,12 @@ one local SQLite file, with callers that follow the protocol described under
 
 | Guarantee | Mechanism |
 |---|---|
-| **Idempotent submission.** A `client_operation_id` is accepted at most once. The same id with the same canonical payload returns `REPLAY` (the existing row, whatever its state); the same id with a different payload returns `CONFLICT`. A `request_id` cannot be rebound to a second operation either. | `UNIQUE` constraints plus a SHA-256 of the canonical JSON payload, checked inside one `BEGIN IMMEDIATE` transaction. |
+| **Idempotent submission.** A `client_operation_id` is accepted at most once. The same id, canonical payload and conversation/device/workspace scope returns `REPLAY` (the existing row, whatever its state). A different payload or scope returns `("CONFLICT", {})`, without existing row fields. A `request_id` cannot be rebound to a second operation either. | Global `UNIQUE` constraints, scope comparisons and a SHA-256 checked inside one `BEGIN IMMEDIATE` transaction. |
 | **Server acceptance order.** Each accepted operation gets an increasing `sequence`. | `INTEGER PRIMARY KEY AUTOINCREMENT`. |
 | **At most one RUNNING operation per conversation, in FIFO order.** | `claim()` and `claim_next()` check running conversations and the oldest queued sequence in the same write transaction as the `QUEUED → RUNNING` update. |
 | **Bounded parallelism across conversations.** At most `lanes` conversations run at once. | The same transaction counts distinct RUNNING conversations. |
 | **No silent re-execution after a restart.** `recover_inflight()` turns every RUNNING row into `UNKNOWN`; never-started `QUEUED` rows stay and can drain. | `claim*()` only ever selects `QUEUED` rows. |
-| **Recovery inbox.** `FAILED` and `UNKNOWN` rows keep the exact submitted payload. `COMPLETED` and `CANCELLED` rows drop it and keep only the receipt (`payload_sha256`, `message_id`, `error_code`, timestamps). | `finish()` clears the payload only for `COMPLETED` and `CANCELLED`. |
+| **Recovery inbox.** `FAILED` and `UNKNOWN` rows keep the submitted payload. `COMPLETED` and `CANCELLED` rows logically clear it and retain identity, scope and receipt fields (`payload_sha256`, `message_id`, `error_code`, timestamps). This is not forensic erasure. | `finish()` sets `payload_json=NULL` only for `COMPLETED` and `CANCELLED`; connections enable `secure_delete=ON` (see limitations). |
 | **Negative receipts.** A client that gave up on an operation it believes was never received can seal the id with `confirm_missing()`. A late copy of that request is then recognised but never queued. | A `CONFIRMED_MISSING` tombstone inserted in one transaction. |
 
 What it deliberately does **not** do: cancel a running turn (that is the
@@ -91,49 +91,74 @@ no method moves a row out of them.
   journal). Methods that check and then write start with `BEGIN IMMEDIATE`, so
   the check and the update are serialised against every other writer on the
   same file.
-- Payloads are canonicalised with
-  `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)` and
-  hashed with SHA-256. Key order and whitespace do not matter; any change of
-  value does.
+- Payloads use Python's
+  `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)`
+  encoded as UTF-8 and hashed with SHA-256. Key order and JSON formatting do not
+  matter; whitespace inside string values does. `NaN`, `Infinity` and
+  `-Infinity` raise `ValueError` before the store opens the DB. This is **not
+  RFC 8785/JCS**: `1` and `1.0` differ, and Unicode is not normalized. Compute
+  digests on your trusted server, or use this encoder on Python clients; do not
+  assume JavaScript or another language produces identical bytes.
 - If a payload has a `workspace_id` key, its value is also stored in its own
-  column so the scope survives payload compaction. When an older database
-  without that column is opened, the column is added and rows that still have a
-  payload are backfilled. Rows whose payload was already cleared stay `NULL`
-  instead of being guessed.
+  column so the scope survives payload compaction. Version-zero databases are
+  migrated once to `PRAGMA user_version=1`, inside `BEGIN IMMEDIATE` with a
+  version recheck after the writer lock. A missing column is added and retained
+  payloads are backfilled once, even if the column already exists. Cleared,
+  invalid or unbound payloads remain `NULL`; later calls do not scan them again.
+  Legacy workspace values are stripped and values longer than 80 characters
+  are ignored. Use a dedicated queue DB; do not share its schema/version field
+  with another application. Migration locking does not make multi-process
+  dispatch/recovery supported.
 - The store is an inbox, not a transcript. Messages and replies belong in your
   conversation history; the store only remembers identities, order, transient
   payloads and receipts.
 
 ### Dispatcher pattern
 
-In the original service, an asyncio HTTP backend used the store like this:
+Use resident workers for a live service, not a drain-once task:
 
-1. **Startup:** call `recover_inflight()` once, then start up to `lanes` drain
-   tasks.
+1. **Startup:** call `recover_inflight()` once before admitting requests, then
+   keep up to `lanes` drain tasks alive, including while the queue is empty.
 2. **New request:** call `submit()`.
    - `CONFLICT` → reject (HTTP 409).
-   - `REPLAY` → return the existing receipt. If the row is still `QUEUED`, make
-     sure a drain task is running. If it is `CONFIRMED_MISSING`, reject.
+   - `REPLAY` → return an authorized, allowlisted receipt, not the whole row.
+     If it is `CONFIRMED_MISSING`, reject. Never run a replay inline.
    - `ACCEPTED` → try `claim(op_id, lanes=lanes)` to run the turn inline. If it
      returns `None` (the conversation is busy, all lanes are in use, or an
      older message of the same conversation is waiting), answer "queued"
      immediately and let a drain task pick it up.
-3. **Drain loop:** `claim_next(lanes=lanes)` → execute → `finish()`; repeat
-   until it returns `None`.
+3. **Resident loop:** `claim_next(lanes=lanes)` → execute → `finish()`; when it
+   returns `None`, wait briefly and try again, **do not exit**. Polling avoids
+   lost notifications: a queued tail is picked up after an inline execution
+   finishes, even if submission raced with an empty scan and no request follows.
 4. **Outcome mapping:** success → `COMPLETED`; user cancel → `CANCELLED`; a
    failure proven to happen before any side effect → `FAILED`; any other
    exception, lost response or task cancellation in the middle of a turn →
    `UNKNOWN`. If the executor refuses to start the turn at all (for example an
    in-memory lane gate disagrees), call `requeue()`.
+5. **Shutdown:** stop admitting requests, wait for inline work, set the stop
+   event and await the drain tasks. Current turns finish; remaining QUEUED work
+   stays durable. Supervise workers: a DB/receipt-write failure must surface,
+   not silently leave a dead worker. This skeleton does not implement a server.
 
 A minimal asyncio skeleton (your `run_turn` and error type):
 
 ```python
 import asyncio
 
-async def drain(store, lanes):
-    while (row := store.claim_next(lanes=lanes)) is not None:
-        await execute(store, row)
+async def drain(store, lanes, stop):
+    while not stop.is_set():
+        row = store.claim_next(lanes=lanes)
+        if row is None:
+            await asyncio.sleep(0.05)
+        else:
+            await execute(store, row)
+
+async def start_drainers(store, lanes):
+    store.recover_inflight()  # before requests or workers, once per owning process
+    stop = asyncio.Event()
+    tasks = [asyncio.create_task(drain(store, lanes, stop)) for _ in range(lanes)]
+    return stop, tasks  # shutdown: stop.set(); await asyncio.gather(*tasks)
 
 async def execute(store, row):
     op = row["client_operation_id"]
@@ -151,15 +176,45 @@ async def execute(store, row):
 ```
 
 [`examples/threaded_dispatcher.py`](examples/threaded_dispatcher.py) is a
-runnable, thread-based version of the same pattern with synthetic data.
+runnable, thread-based example with synthetic data. Its default `run_workers()`
+drains a finite preloaded batch with a 30-second safety bound; for a live service,
+pass a `threading.Event` as `stop` to keep workers resident until it is set.
+The tests exercise both an initially idle worker with an inline/queued tail and
+a submission exactly at the empty-scan boundary.
+
+### Scope and external receipts
+
+This is a trusted server-side store, **not an authentication layer**. Both IDs
+are globally unique, not namespaced per conversation. `submit()` compares
+conversation, device (including `None`) and stored workspace (including `NULL`)
+before replay; every conflict returns `{}`. An unused new `request_id` may
+reconcile an existing operation, but cannot take an ID owned by another one.
+`confirm_missing()` returns `EXISTING` only in the same scope (even if the digest
+differs); foreign scope or request collisions return `("CONFLICT", {})`.
+Old compacted rows with unknown workspace remain unbound and are not rebound.
+
+Derive and authorize conversation/device/workspace from the authenticated
+caller, and use unguessable global IDs. A generic conflict can still reveal that
+an ID is occupied. Same-scope replay/EXISTING rows may contain retained payloads;
+only expose an allowlist such as `client_operation_id`, `sequence`, `state` and
+`message_id` after authorization. `get()`, `list()`, claims, `finish()`, `requeue()`
+and recovery are trusted administrative operations with no caller identity or
+ownership token: never expose them directly as unauthenticated endpoints.
 
 ## Quick start
 
 ```bash
-git clone <this repository> && cd durable-chat-queue
+git clone https://github.com/willind421-hub/durable-chat-queue.git && cd durable-chat-queue
 python -m pip install -e .
 python examples/threaded_dispatcher.py
 ```
+
+The demo uses a temporary DB by default. `--db` accepts **a new path only**:
+existing files (including empty files), directories, symlinks and `-wal`, `-shm`,
+`-journal` sidecars are refused before constructing the store. Creation uses
+exclusive mode. Use a trusted directory with no competing writer to that path;
+sidecar checks are not an atomic reservation of the whole directory. Never point
+the demo at an operational DB. A second run with the same `--db` fails safely.
 
 ```python
 from pathlib import Path
@@ -217,14 +272,15 @@ uses its own connection.
 | `finish(client_operation_id, *, state, message_id=None, error_code=None)` | Record the receipt of a RUNNING operation. `state` ∈ `COMPLETED`, `FAILED`, `CANCELLED`, `UNKNOWN`. | row; `ValueError` for another state, `KeyError` if not RUNNING |
 | `requeue(client_operation_id, *, error_code=None)` | Put a RUNNING operation that never started back to `QUEUED` (same sequence). | `None` |
 | `recover_inflight()` | Mark every RUNNING operation `UNKNOWN`. Call at startup only. | number of rows fenced |
-| `confirm_missing(*, client_operation_id, request_id, conversation_id, device_id, workspace_id, payload_sha256)` | Seal an id the client believes was never received. | `("CONFIRMED_MISSING" \| "EXISTING", row)` |
+| `confirm_missing(*, client_operation_id, request_id, conversation_id, device_id, workspace_id, payload_sha256)` | Seal an id the client believes was never received; reconcile existing same-scope rows. | `("CONFIRMED_MISSING" \| "EXISTING", row)` or `("CONFLICT", {})` |
 | `get(client_operation_id)` | Read one operation. | row or `None` |
 | `list(*, conversation_id, after_sequence=0, limit=50)` | Page through a conversation (1–100 rows). | list of rows |
 | `counts()` | Number of operations per state. | `dict[str, int]` |
-| `canonical_payload(payload)` | Canonical JSON and its SHA-256 (use it on the client for `confirm_missing`). | `(json_text, sha256_hex)` |
+| `canonical_payload(payload)` | Python-encoded JSON and its SHA-256; preferably compute on the trusted server for `confirm_missing`. | `(json_text, sha256_hex)`; `ValueError` for non-finite numbers |
 
 A row is a `dict` with the table columns, except that `payload_json` is
 replaced by `payload` (the decoded dict, or `None` once cleared).
+`submit()` returns an empty dict on every `CONFLICT`, never the existing row.
 
 ## Running tests
 
@@ -247,6 +303,12 @@ CI runs the tests and the example on Ubuntu and Windows with Python 3.10 and
   processes that each call it share one file. This is not a distributed queue,
   and the file should not live on a network filesystem (SQLite WAL needs
   shared memory on one host).
+- **Trusted service API, not authorization.** Scope checks on `submit()` and
+  `confirm_missing()` do not authenticate callers. Reads and state-changing
+  methods have no per-caller permissions or worker fencing tokens; keep them
+  behind your trusted service. `requeue()` returns `None` and silently does
+  nothing for a missing or non-RUNNING operation; it is not an acknowledgement
+  that a job was put back.
 - **A stuck worker blocks its conversation.** If a worker stops without calling
   `finish()` while the process keeps running, its conversation stays RUNNING
   (and blocked) until the next `recover_inflight()`. Always record a receipt on
@@ -260,13 +322,25 @@ CI runs the tests and the example on Ubuntu and Windows with Python 3.10 and
 - **No retention.** Rows, including receipts, are never deleted. Archive or prune
   them yourself.
 - **Built for human-paced traffic.** Each call opens a fresh connection and
-  re-runs the idempotent schema check. That keeps the code simple and robust,
-  but it has not been benchmarked for high-throughput job processing.
+  checks the schema version; migration/backfill runs only once. SQLite calls are
+  synchronous (including in the asyncio skeleton) and can wait for a lock for
+  about five seconds. This has not been benchmarked for high-throughput work.
+- **Logical clearing, not guaranteed physical erasure.** `secure_delete=ON`
+  requests SQLite overwrite deleted content as pages are rewritten. Tests check
+  marker absence from the checkpointed main DB, but old WAL frames and reader
+  snapshots can still contain payloads. It does not scrub previously freed
+  pages from older versions, backups, filesystem snapshots, SSD copies, memory
+  or application logs. There is no encryption or automatic checkpoint/secure
+  wipe policy. Restrict DB/sidecar directory permissions and manage backups.
+  File permissions inherit the OS defaults; the library does not harden them.
+  Identity, workspace, hash and receipt metadata remain; FAILED/UNKNOWN keep
+  payloads indefinitely. Do not put secrets in receipt fields.
 - Payloads must be JSON-serialisable dicts; the store does not limit their size.
   During legacy backfill, `workspace_id` values longer than 80 characters are
   ignored.
-- `confirm_missing()` trusts the caller to compute `payload_sha256` with the same
-  canonicalisation as `canonical_payload()`.
+- `confirm_missing()` trusts the caller's digest; it cannot verify an absent
+  payload. Use `canonical_payload()` on the trusted server; this is not a
+  cross-language canonical JSON protocol.
 - Timestamps are UTC ISO-8601 strings from the local clock; ordering always uses
   `sequence`, never time.
 
@@ -274,10 +348,11 @@ CI runs the tests and the example on Ubuntu and Windows with Python 3.10 and
 
 This code was extracted from willind, a discontinued personal AI-assistant
 project, where it served as the command inbox between desktop/mobile chat
-clients and a local assistant service. The store logic is unchanged. For this
-release, comments were translated to English, docstrings were added to public
-methods, connections are now closed explicitly, and the surrounding HTTP
-service was replaced by a synthetic example.
+clients and a local assistant service. The standalone version adds scoped
+reconciliation, one-time locked migration, SQLite secure-delete hardening and
+non-finite JSON rejection, with regression tests and synthetic dispatcher
+examples. Comments/docstrings are in English and connections close explicitly;
+the surrounding HTTP service is not included.
 
 ## License
 
